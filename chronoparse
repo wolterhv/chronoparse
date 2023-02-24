@@ -8,13 +8,55 @@ import stat
 import sys
 
 import tabulate
+import yaml
 
 # Global variables
 
 TIMESHEET_PATH = "/mnt/work/timesheets"
 TSEVENT_CAT_BREAK = "BREAK"
-LOG_DEBUG = False
-DAILY_WORK_QUOTA = 7.5*3600
+CONFIG_FILE_NAME = "chronoparse.yml"
+
+log_debug_g = False
+
+class Config:
+
+    def __init__(self):
+        # Initialise to default values.
+        self.timesheet_path = self.get_default_timesheet_path()
+        self.daily_work_quota = 8 # in hours
+
+    def get_default_timesheet_path(self):
+        return "chronoparse.yml"
+
+    def get_daily_work_quota_in_seconds(self):
+        return 3600 * self.daily_work_quota
+
+    def load_config(self):
+        xdg_config_home = os.getenv("XDG_CONFIG_HOME")
+        expected_config_fpath = None
+        
+        if xdg_config_home is None:
+            log_debug("'XDG_CONFIG_HOME' is not defined.")
+            expected_config_fpath = CONFIG_FILE_NAME
+        else:
+            expected_config_fpath = os.path.join(xdg_config_home, \
+                                                 "chronoparse", \
+                                                 CONFIG_FILE_NAME)
+
+        log_debug(f"Loading config from '{expected_config_fpath}'.")
+
+        with open(expected_config_fpath, "r") as config_fobj:
+            config_data = yaml.safe_load(config_fobj)
+            self.timesheet_path = config_data["chronoparse"]["timesheet_path"]
+            self.daily_work_quota = float(config_data["chronoparse"]["daily_work_quota"])
+            
+        return
+
+    def dump_config(self):
+        print( "chronoparse:\n" \
+              f"    timesheet_path: \"{self.timesheet_path}\"\n" \
+              f"    daily_work_quota: {self.daily_work_quota}")
+        return
 
 # Global classes
 
@@ -112,7 +154,7 @@ def log_error(error_string):
     return
 
 def log_debug(debug_string):
-    if LOG_DEBUG:
+    if log_debug_g:
         print(f"debug: {debug_string}")
     return
 
@@ -145,7 +187,7 @@ def report_from_timesheet(timesheet):
     raise NotImplementedError
     return
 
-def report_from_fpath(fpath, date):
+def report_from_fpath(config, fpath, date):
     total_time = datetime.timedelta(seconds=0)
     prev_starttime = None
     prev_endtime = None
@@ -186,18 +228,18 @@ def report_from_fpath(fpath, date):
 
     print(f"Total work time: {datetime_timedelta_format_both(total_time)}")
 
-    if total_time.total_seconds() < DAILY_WORK_QUOTA:
+    if total_time.total_seconds() < config.daily_work_quota:
         exit_time = timesheet.tsevent_list[-1:][0].starttime + (datetime.timedelta(hours=7.5) - total_time)
         print(f"Daily work quota exit time: {datetime_time_format_hhmm(exit_time.time())}")
-    elif total_time.total_seconds() > DAILY_WORK_QUOTA:
+    elif total_time.total_seconds() > config.daily_work_quota:
         print(f"You've done {datetime_timedelta_format_both(total_time - datetime.timedelta(hours=7.5))} of overtime!")
     else:
         print(f"Perfect time!")
 
     return
 
-def report_from_date(date):
-    report_from_fpath(timesheet_fpath_from_date(date), date)
+def report_from_date(config, date):
+    report_from_fpath(config, timesheet_fpath_from_date(date), date)
     return
 
 def timesheet_fpath_from_date(date):
@@ -346,7 +388,12 @@ def print_help(callname):
               f"will attempt to generate a report from the timesheet corresponding to DATE.\n\n" \
           f"    When called with the arguments RANGE_START_DATE and RANGE_END_DATE, both arguments must be " \
               f"dates in YYYY-MM-DD format and {callname} will attempt to generate a report from the set " \
-              f"of timesheets found within the given date range.\n")
+              f"of timesheets found within the given date range.\n"
+           "\n" \
+              f"{callname} attempts to load configuration from " \
+              f"'$XDG_CONFIG_HOME/chronoparse/chronoparse.yml', where" \
+              f"'$XDG_CONFIG_HOME' is an environment variable named " \
+              f"'XDG_CONFIG_HOME'.")
     return
 
 # Main thread
@@ -355,13 +402,27 @@ if __name__ == "__main__":
 
     exit_code = -1
 
-    # Define and parse arguments
+    # Initialise.
+    config = Config()
+    config.load_config()
+
+    # Define arguments.
+
     parser = argparse.ArgumentParser(
             prog = "chronoparse",
-            description = "Parses Chronoparse TSV timesheets.",
+            description = "Parses Chronoparse TSV timesheets. Configuration " \
+                          "is sought at " \
+                          "'$XDG_CONFIG_HOME/chronoparse/chronoparse.yml'.",
             epilog="DATE arguments shall be dates in YYYY-MM-DD format according to the ISO 8601 norm.",
             argument_default=argparse.SUPPRESS)
+
+    parser.add_argument("--debug",
+                        action="store_true",
+                        help="Enable debug output.",
+                        dest="debug")
+
     args_group = parser.add_mutually_exclusive_group()
+
     args_group.add_argument("-d", "--date",
                             action="store",
                             help="Print report for DATE.",
@@ -385,14 +446,22 @@ if __name__ == "__main__":
                             help="Print week report table for current week or for DATE's week.",
                             metavar="DATE",
                             dest="week_date_string")
+    args_group.add_argument("--dump-config",
+                            action="store_true",
+                            help="Dump current configuration.",
+                            dest="dump_config")
+
     args = parser.parse_args()
 
-    # Process arguments
+    # Process arguments.
+
+    if hasattr(args, "debug"):
+        log_debug_g = args.debug
 
     if hasattr(args, "date"):
         try:
             date = datetime.date.fromisoformat(args.date)
-            report_from_date(date)
+            report_from_date(config, date)
             exit_code = 0
         except ValueError:
             log_error(f"Argument \"{args.date}\" is not a valid date.")
@@ -405,6 +474,21 @@ if __name__ == "__main__":
             exit_code = 0
         except ValueError:
             log_error(f"At least one of \"{args.range[0]}\" and \"{args.range[1]}\" is not a valid date.")
+
+    elif hasattr(args, "sap_date_string"):
+        try:
+            weekdate = None
+
+            if args.sap_date_string is None:
+                weekdate = datetime.date.today()
+            else:
+                weekdate = datetime.date.fromisoformat(args.sap_date_string)
+
+            monday = datetime_get_monday_from_week_date(weekdate)
+            sap_print_week_report_for_week_from_monday(monday)
+            exit_code = 0
+        except ValueError:
+            log_error(f"\"{args.sap_date_string}\" is not a valid date.")
 
     elif hasattr(args, "week_date_string"):
         try:
@@ -422,27 +506,16 @@ if __name__ == "__main__":
         except ValueError:
             log_error(f"\"{args.week_date_string}\" is not a valid date.")
 
-    elif hasattr(args, "sap_date_string"):
-        try:
-            weekdate = None
-
-            if args.sap_date_string is None:
-                weekdate = datetime.date.today()
-            else:
-                weekdate = datetime.date.fromisoformat(args.sap_date_string)
-
-            monday = datetime_get_monday_from_week_date(weekdate)
-            sap_print_week_report_for_week_from_monday(monday)
-            exit_code = 0
-        except ValueError:
-            log_error(f"\"{args.sap_date_string}\" is not a valid date.")
+    elif hasattr(args, "dump_config"):
+        config.dump_config()
 
     else:
         try:
             today = datetime.date.today()
-            report_from_date(today)
+            report_from_date(config, today)
             exit_code = 0
         except FileNotFoundError:
             log_error(f"No timesheet found for today ({today.isoformat()}).")
+            log_debug(f"Searched in '{config.timesheet_path}'.")
 
     sys.exit(exit_code)
