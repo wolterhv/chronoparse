@@ -1,0 +1,15 @@
+#!/bin/bash
+
+SEARCH_TERM=$1
+DATES="${@:2}"
+echo -n "Summing time with keyword \"$SEARCH_TERM\" in dates: "
+echo $DATES | tr ' ' '\n' | xargs -I{} echo -n "{}, "; echo -e "\b\b."
+
+echo "Timesheet data:"
+echo $DATES \
+        | xargs -n1 chronoparse -d \
+        | grep $SEARCH_TERM \
+        | awk \
+'BEGIN {minutes = 0;}
+match($2, /([[:digit:]]+):([[:digit:]]+)/, tmp) { minutes += tmp[1]*60 + tmp[2]; print $0; }
+END { printf "Total work: %d min (%.2f h)\n",minutes,(minutes/60.0); }'

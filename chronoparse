@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+
+import argparse
+import datetime
+import math
+import os
+import stat
+import sys
+
+import tabulate
+
+# Global variables
+
+TIMESHEET_PATH = "/mnt/work/timesheets"
+TSEVENT_CAT_BREAK = "BREAK"
+LOG_DEBUG = False
+DAILY_WORK_QUOTA = 7.5*3600
+
+# Global classes
+
+class TimesheetEvent:
+
+    def __init__(self, starttime, category="", description=""):
+        self.starttime = starttime
+        self.duration = None
+        self.category = category
+        self.description = description
+        return
+
+class Timesheet:
+
+    def __init__(self):
+        self.date = None
+        self.tsevent_list = list()
+        self.tsevent_category_clocks = dict()
+        return
+
+# Global functions
+
+def timesheet_from_fstream(fstream, date):
+    timesheet = Timesheet()
+    timesheet.date = date
+    # timesheet.tsevent_list
+    prev_tsevent = None
+    duration = None
+
+    lineno = 0
+    for line in fstream:
+        lineno += 1
+        # Skip empty and commented lines
+        if line[0] in {"#", "\n"}:
+            continue
+        else:
+            tsevent = timesheet_process_line(date, lineno, line)
+            if tsevent is not None:
+                # Catch non-chronologicalities
+                if      prev_tsevent is not None \
+                and     prev_tsevent.starttime > tsevent.starttime:
+                    log_error(f"TimesheetEvent defined in line {lineno} starts before previous tsevent, therefore will be ignored.")
+                    continue
+                # Register proper TimesheetEvent s
+                else:
+                    # If there is a previous TimesheetEvent, the current TimesheetEvent marks the end of it
+                    if prev_tsevent is not None:
+                        # Create the clock for the previous TimesheetEvent if it doesn't exist
+                        if prev_tsevent.category not in timesheet.tsevent_category_clocks.keys():
+                            timesheet.tsevent_category_clocks[prev_tsevent.category] = datetime.timedelta(seconds=0)
+                        duration = (tsevent.starttime - prev_tsevent.starttime)
+                        timesheet.tsevent_list[-1:][0].duration = duration
+                        timesheet.tsevent_category_clocks[prev_tsevent.category] += duration
+                    timesheet.tsevent_list.append(tsevent)
+                prev_tsevent = tsevent
+
+    return timesheet
+
+def timesheet_from_fpath(fpath, date):
+    with open(fpath, 'r') as fstream:
+        return timesheet_from_fstream(fstream, date)
+
+def timesheet_process_line(date, lineno, line):
+    tsevent_parts = line.split('\t')
+
+    starttime = None
+    category = ""
+    description = ""
+
+    # Check length
+    if len(tsevent_parts) < 2:
+        log_error(f"Line {lineno} is malformed, therefore will be ignored.")
+        log_error(f"    line: \"{line}\"")
+        return None
+    else:
+        try:
+            starttime = datetime.datetime.combine(date, datetime.time.fromisoformat(tsevent_parts[0]))
+        except ValueError:
+            log_error(f"Malformed time string in line {lineno}, line will be ignored.")
+            return None
+        
+        category = tsevent_parts[1].strip()
+
+        if len(tsevent_parts) >= 3:
+            description = " ".join(tsevent_parts[2:])
+            if description[-1:] == "\n":
+                description = description[:-1]
+
+        log_debug(f"New TimesheetEvent. Start time: {datetime_time_format_hhmm(starttime.time())}, category: {category}, description: {description}")
+
+        return TimesheetEvent(starttime, category, description)
+
+def log_error(error_string):
+    print(f"error: {error_string}")
+    return
+
+def log_debug(debug_string):
+    if LOG_DEBUG:
+        print(f"debug: {debug_string}")
+    return
+
+def datetime_timedelta_split(timedelta):
+    hours = math.floor(timedelta.total_seconds()/3600)
+    minutes = max(0, (timedelta.total_seconds() - 3600*hours)/60)
+    seconds = max(0, timedelta.total_seconds() - 3600*hours - 60*minutes)
+    return (hours, minutes, seconds)
+
+def datetime_timedelta_format_hhmm(dt_timedelta, inc_unit=True):
+    hours, minutes, _ = datetime_timedelta_split(dt_timedelta)
+    outstr = f"{hours}:{minutes:02g}"
+    if inc_unit:
+        outstr = f"{outstr} h"
+    return outstr
+
+def datetime_timedelta_format_decimal(dt_timedelta, inc_unit=True):
+    outstr = f"{dt_timedelta.total_seconds()/3600:.2f}"
+    if inc_unit:
+        outstr = f"{outstr} h"
+    return outstr
+
+def datetime_time_format_hhmm(dt_time):
+    return dt_time.isoformat("minutes")
+
+def datetime_timedelta_format_both(dt_timedelta, inc_unit=True):
+    return f"{datetime_timedelta_format_decimal(dt_timedelta, inc_unit)} (i.e. {datetime_timedelta_format_hhmm(dt_timedelta, inc_unit)})"
+
+def report_from_timesheet(timesheet):
+    raise NotImplementedError
+    return
+
+def report_from_fpath(fpath, date):
+    total_time = datetime.timedelta(seconds=0)
+    prev_starttime = None
+    prev_endtime = None
+    duration_string = "NA"
+
+    timesheet = None
+    with open(fpath, "r") as fstream:
+        timesheet = timesheet_from_fstream(fstream, date)
+    
+    day_table_headers = ("Start time", "Duration / h", "Category", "Description")
+    summary_table = list()
+
+    for tsevent in timesheet.tsevent_list:
+        if tsevent.duration is not None:
+            if tsevent.category != TSEVENT_CAT_BREAK:
+                total_time += tsevent.duration
+            duration_string = datetime_timedelta_format_hhmm(tsevent.duration, inc_unit=False)
+        else:
+            duration_string = "NA"
+
+        summary_table.append((datetime_time_format_hhmm(tsevent.starttime.time()), duration_string, tsevent.category, tsevent.description))
+
+    category_table_headers = ("Category", "Time / h")
+    category_table = list()
+
+    for cat in timesheet.tsevent_category_clocks:
+        category_table.append((cat, datetime_timedelta_format_decimal(timesheet.tsevent_category_clocks[cat], inc_unit=False)))
+
+    print("Time worked, per event\n" \
+          "----------------------\n")
+    print(tabulate.tabulate(summary_table, headers=day_table_headers, colalign=("center", "center", "left", "left")))
+    print()
+
+    print("Time worked, per category\n" \
+          "-------------------------\n")
+    print(tabulate.tabulate(category_table, headers=category_table_headers, floatfmt=".2f"))
+    print()
+
+    print(f"Total work time: {datetime_timedelta_format_both(total_time)}")
+
+    if total_time.total_seconds() < DAILY_WORK_QUOTA:
+        exit_time = timesheet.tsevent_list[-1:][0].starttime + (datetime.timedelta(hours=7.5) - total_time)
+        print(f"Daily work quota exit time: {datetime_time_format_hhmm(exit_time.time())}")
+    elif total_time.total_seconds() > DAILY_WORK_QUOTA:
+        print(f"You've done {datetime_timedelta_format_both(total_time - datetime.timedelta(hours=7.5))} of overtime!")
+    else:
+        print(f"Perfect time!")
+
+    return
+
+def report_from_date(date):
+    report_from_fpath(timesheet_fpath_from_date(date), date)
+    return
+
+def timesheet_fpath_from_date(date):
+    return os.path.join(TIMESHEET_PATH, f"{date.isoformat()}.tsv")
+
+def timesheetlist_get_categories(timesheets):
+    categories = set()
+    for ts in timesheets:
+        for tse in ts.tsevent_list:
+            if tse.category not in categories:
+                categories.add(tse.category)
+    return categories
+
+def timesheet_exists_for_date(date):
+    ts_fpath = timesheet_fpath_from_date(date)
+    return os.path.isfile(ts_fpath) and os.access(ts_fpath, os.R_OK)
+
+def timesheetlist_generate_from_date_range(date0, date1):
+    timesheets = list()
+    daten = None
+    daycount_td = date1 - date0
+    for dayn in range(daycount_td.days + 1):
+        daten = date0 + datetime.timedelta(days=dayn)
+        log_debug(f"Parsing timesheet from {daten.isoformat()}")
+        if timesheet_exists_for_date(daten):
+            timesheets.append(timesheet_from_fpath(timesheet_fpath_from_date(daten), daten))
+    return timesheets
+
+def report_from_date_range(date0, date1):
+    """
+    Outputs summary table, category table and total worked time.
+
+    Summary table shows task categories as columns and days as rows.  Each cell
+    shows the number of hours worked on the day and in the category.
+
+    Category table shows time worked per category throughout the date range.
+
+    Total worked time shows total worked time.
+    """
+    # Scan data
+    timesheets = timesheetlist_generate_from_date_range(date0, date1)
+    categories = timesheetlist_get_categories(timesheets)
+
+    category_list = list(categories)
+    category_list.sort()
+    summary_th = ["Date", "Worked"] + [c for c in category_list]
+    category_th = ["Category", "Time / h"]
+
+    # Fill tables
+    #   Summary table
+    summary_table = list()
+    category_times = [datetime.timedelta(seconds=0) for cat in category_list]
+    category_table = [[cat, datetime.timedelta(seconds=0)] for cat in category_list]
+    total_worked_time = datetime.timedelta(seconds=0)
+    for ts in timesheets:
+        ts_category_times = list()
+        daily_worked_time = datetime.timedelta(seconds=0)
+        for (catn, cat) in enumerate(category_list):
+            cat_td = None
+            if cat in ts.tsevent_category_clocks.keys():
+                cat_td = ts.tsevent_category_clocks[cat]
+            else:
+                cat_td = datetime.timedelta(seconds=0)
+
+            if cat != TSEVENT_CAT_BREAK:
+                daily_worked_time += cat_td
+            category_table[catn][1] += cat_td
+            ts_category_times.append(datetime_timedelta_format_decimal(cat_td))
+
+        summary_table.append(  [ts.date.isoformat(), \
+                                datetime_timedelta_format_decimal(daily_worked_time)] \
+                             + ts_category_times)
+        total_worked_time += daily_worked_time
+    #   Category table
+
+    print("Time worked, per day, per category\n" \
+          "----------------------------------\n")
+    print(tabulate.tabulate(summary_table, headers=summary_th, colalign=["left", "right"]+["right"]*len(categories)))
+    print("\n")
+    
+    print("Time worked, per category\n" \
+          "-------------------------\n")
+    print(tabulate.tabulate([(row[0], datetime_timedelta_format_decimal(row[1])) for row in category_table], headers=category_th, colalign=("left", "right")))
+    print("\n")
+
+    print(f"Time worked, in total\n" \
+           "---------------------\n")
+    print(f"Total: {datetime_timedelta_format_both(total_worked_time)}")
+
+    return
+
+def build_sap_table(week_ts_list):
+    """
+    Generates a CSV table where each row has the following structure:
+    *   Cell 0: Category name
+    *   Cell 1: Empty
+    *   Cells 2 through 8: time worked per category for each of day of the week.
+    Time is in decimal format, with period as decimal separator and only two
+    digits of precision.
+    """
+    sap_table_str = ""
+    # Build table
+    categories = timesheetlist_get_categories(week_ts_list)
+    if TSEVENT_CAT_BREAK in categories:
+        categories.remove(TSEVENT_CAT_BREAK)
+    category_list = list(categories)
+    category_list.sort()
+    for (catn, cat) in enumerate(category_list):
+        cat_times = [""]*7
+        for (tsn, ts) in enumerate(week_ts_list):
+            if  cat != TSEVENT_CAT_BREAK \
+            and cat in ts.tsevent_category_clocks.keys():
+                cat_times[tsn] = datetime_timedelta_format_decimal(ts.tsevent_category_clocks[cat], False)
+        sap_table_str += "\t".join([cat, ""] + cat_times) + "\t\n"
+
+    return sap_table_str
+
+def datetime_get_last_monday():
+    """Returns the previous monday or the current date if called on a monday."""
+    today = datetime.date.today()
+    return today - datetime.timedelta(days=today.weekday())
+
+def datetime_get_monday_from_week_date(weekdate):
+    return weekdate - datetime.timedelta(days=weekdate.weekday())
+
+def sap_print_week_report_for_week_from_monday(monday):
+    friday = monday + datetime.timedelta(days=4)
+    timesheets = timesheetlist_generate_from_date_range(monday, friday)
+    print(build_sap_table(timesheets))
+    return
+
+def sap_print_week_report_from_current_week():
+    monday = datetime_get_last_monday()
+    sap_print_week_report_for_week_from_monday(monday)
+    return
+
+def print_help(callname):
+    print(f"SYNOPSYS\n" \
+          f"    {callname}\n" \
+          f"    {callname} DATE\n" \
+          f"    {callname} RANGE_START_DATE RANGE_END_DATE\n" \
+           "\n" \
+          f"DESCRIPTION\n" \
+          f"    {callname} parses timesheet data from timesheet files and generates reports therefrom.\n\n" \
+          f"    When called with argument DATE, DATE must be a date in YYYY-MM-DD format and {callname} " \
+              f"will attempt to generate a report from the timesheet corresponding to DATE.\n\n" \
+          f"    When called with the arguments RANGE_START_DATE and RANGE_END_DATE, both arguments must be " \
+              f"dates in YYYY-MM-DD format and {callname} will attempt to generate a report from the set " \
+              f"of timesheets found within the given date range.\n")
+    return
+
+# Main thread
+
+if __name__ == "__main__":
+
+    exit_code = -1
+
+    # Define and parse arguments
+    parser = argparse.ArgumentParser(
+            prog = "chronoparse",
+            description = "Parses Chronoparse TSV timesheets.",
+            epilog="DATE arguments shall be dates in YYYY-MM-DD format according to the ISO 8601 norm.",
+            argument_default=argparse.SUPPRESS)
+    args_group = parser.add_mutually_exclusive_group()
+    args_group.add_argument("-d", "--date",
+                            action="store",
+                            help="Print report for DATE.",
+                            metavar="DATE",
+                            dest="date")
+    args_group.add_argument("-r", "--range",
+                            action="store",
+                            nargs=2,
+                            help="Print report for date range from DATE to DATE, respectively in the order provided.",
+                            metavar="DATE",
+                            dest="range")
+    args_group.add_argument("-s", "--sap",
+                            action="store",
+                            nargs="?",
+                            help="Print SAP TSV for current week or for DATE's week.",
+                            metavar="DATE",
+                            dest="sap_date_string")
+    args_group.add_argument("-w", "--week",
+                            action="store",
+                            nargs="?",
+                            help="Print week report table for current week or for DATE's week.",
+                            metavar="DATE",
+                            dest="week_date_string")
+    args = parser.parse_args()
+
+    # Process arguments
+
+    if hasattr(args, "date"):
+        try:
+            date = datetime.date.fromisoformat(args.date)
+            report_from_date(date)
+            exit_code = 0
+        except ValueError:
+            log_error(f"Argument \"{args.date}\" is not a valid date.")
+
+    elif hasattr(args, "range"):
+        try:
+            date0 = datetime.date.fromisoformat(args.range[0])
+            date1 = datetime.date.fromisoformat(args.range[1])
+            report_from_date_range(date0, date1)
+            exit_code = 0
+        except ValueError:
+            log_error(f"At least one of \"{args.range[0]}\" and \"{args.range[1]}\" is not a valid date.")
+
+    elif hasattr(args, "week_date_string"):
+        try:
+            weekdate = None
+
+            if args.week_date_string is None:
+                weekdate = datetime.date.today()
+            else:
+                weekdate = datetime.date.fromisoformat(args.week_date_string)
+
+            monday = datetime_get_monday_from_week_date(weekdate)
+            friday = monday + datetime.timedelta(days=4)
+            report_from_date_range(monday, friday)
+            exit_code = 0
+        except ValueError:
+            log_error(f"\"{args.week_date_string}\" is not a valid date.")
+
+    elif hasattr(args, "sap_date_string"):
+        try:
+            weekdate = None
+
+            if args.sap_date_string is None:
+                weekdate = datetime.date.today()
+            else:
+                weekdate = datetime.date.fromisoformat(args.sap_date_string)
+
+            monday = datetime_get_monday_from_week_date(weekdate)
+            sap_print_week_report_for_week_from_monday(monday)
+            exit_code = 0
+        except ValueError:
+            log_error(f"\"{args.sap_date_string}\" is not a valid date.")
+
+    else:
+        try:
+            today = datetime.date.today()
+            report_from_date(today)
+            exit_code = 0
+        except FileNotFoundError:
+            log_error(f"No timesheet found for today ({today.isoformat()}).")
+
+    sys.exit(exit_code)
