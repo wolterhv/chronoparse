@@ -12,11 +12,17 @@ import yaml
 
 # Global variables
 
-TIMESHEET_PATH = "/mnt/work/timesheets"
 TSEVENT_CAT_BREAK = "BREAK"
 CONFIG_FILE_NAME = "chronoparse.yml"
 
 log_debug_g = False
+
+# Global classes
+
+class ConfigError(Exception):
+
+    def __str__(self):
+        return "Configuration file is unhealthy."
 
 class Config:
 
@@ -26,10 +32,13 @@ class Config:
         self.daily_work_quota = 8 # in hours
 
     def get_default_timesheet_path(self):
-        return "chronoparse.yml"
+        return os.path.join(os.getenv("HOME","."), "timesheets")
+
+    def get_daily_work_quota_in_hours(self):
+        return self.daily_work_quota
 
     def get_daily_work_quota_in_seconds(self):
-        return 3600 * self.daily_work_quota
+        return 3600 * self.get_daily_work_quota_in_hours()
 
     def load_config(self):
         xdg_config_home = os.getenv("XDG_CONFIG_HOME")
@@ -45,11 +54,29 @@ class Config:
 
         log_debug(f"Loading config from '{expected_config_fpath}'.")
 
-        with open(expected_config_fpath, "r") as config_fobj:
-            config_data = yaml.safe_load(config_fobj)
-            self.timesheet_path = config_data["chronoparse"]["timesheet_path"]
-            self.daily_work_quota = float(config_data["chronoparse"]["daily_work_quota"])
-            
+        try:
+            with open(expected_config_fpath, "r") as config_fobj:
+                config_data = yaml.safe_load(config_fobj)
+
+                if config_data is None:
+                    raise ConfigError
+                elif "chronoparse" not in config_data:
+                    raise ConfigError()
+                elif "timesheet_path" not in config_data["chronoparse"]:
+                    raise ConfigError()
+                elif "daily_work_quota" not in config_data["chronoparse"]:
+                    raise ConfigError()
+                else:
+                    self.timesheet_path = config_data["chronoparse"]["timesheet_path"]
+                    self.daily_work_quota = float(config_data["chronoparse"]["daily_work_quota"])
+
+        except ConfigError as e:
+            log_error(e)
+
+        except FileNotFoundError:
+            log_error(f"Config file '{expected_config_fpath}' does not exist. " \
+                       "Using default configuration.")
+
         return
 
     def dump_config(self):
@@ -57,8 +84,6 @@ class Config:
               f"    timesheet_path: \"{self.timesheet_path}\"\n" \
               f"    daily_work_quota: {self.daily_work_quota}")
         return
-
-# Global classes
 
 class TimesheetEvent:
 
@@ -78,6 +103,29 @@ class Timesheet:
         return
 
 # Global functions
+
+def log_error(error_string):
+    print(f"error: {error_string}")
+    return
+
+def log_debug(debug_string):
+    if log_debug_g:
+        print(f"debug: {debug_string}")
+    return
+
+def preprocess_fpath(fpath):
+    preprocessed_fpath = fpath
+
+    # Replace '~' for HOME
+    if "~" in fpath:
+        home_dir = os.getenv("HOME")
+
+        if home_dir is None:
+            raise NotADirectoryError("HOME")
+        else:
+            preprocessed_fpath = preprocessed_fpath.replace("~", home_dir)
+
+    return preprocessed_fpath
 
 def timesheet_from_fstream(fstream, date):
     timesheet = Timesheet()
@@ -149,15 +197,6 @@ def timesheet_process_line(date, lineno, line):
 
         return TimesheetEvent(starttime, category, description)
 
-def log_error(error_string):
-    print(f"error: {error_string}")
-    return
-
-def log_debug(debug_string):
-    if log_debug_g:
-        print(f"debug: {debug_string}")
-    return
-
 def datetime_timedelta_split(timedelta):
     hours = math.floor(timedelta.total_seconds()/3600)
     minutes = max(0, (timedelta.total_seconds() - 3600*hours)/60)
@@ -196,7 +235,7 @@ def report_from_fpath(config, fpath, date):
     timesheet = None
     with open(fpath, "r") as fstream:
         timesheet = timesheet_from_fstream(fstream, date)
-    
+
     day_table_headers = ("Start time", "Duration / h", "Category", "Description")
     summary_table = list()
 
@@ -228,22 +267,31 @@ def report_from_fpath(config, fpath, date):
 
     print(f"Total work time: {datetime_timedelta_format_both(total_time)}")
 
-    if total_time.total_seconds() < config.daily_work_quota:
-        exit_time = timesheet.tsevent_list[-1:][0].starttime + (datetime.timedelta(hours=7.5) - total_time)
+    total_time_in_seconds = total_time.total_seconds()
+    daily_work_quota_in_seconds = config.get_daily_work_quota_in_seconds()
+
+    if total_time_in_seconds < daily_work_quota_in_seconds:
+        exit_time = timesheet.tsevent_list[-1:][0].starttime \
+                    + (datetime.timedelta(seconds=daily_work_quota_in_seconds) \
+                    - total_time)
         print(f"Daily work quota exit time: {datetime_time_format_hhmm(exit_time.time())}")
-    elif total_time.total_seconds() > config.daily_work_quota:
-        print(f"You've done {datetime_timedelta_format_both(total_time - datetime.timedelta(hours=7.5))} of overtime!")
+    elif total_time_in_seconds > daily_work_quota_in_seconds:
+        overtime = total_time \
+                   - datetime.timedelta(seconds=daily_work_quota_in_seconds)
+        print(f"You've done {datetime_timedelta_format_both(overtime)} of overtime!")
     else:
         print(f"Perfect time!")
 
     return
 
 def report_from_date(config, date):
-    report_from_fpath(config, timesheet_fpath_from_date(date), date)
+    report_from_fpath(config, timesheet_fpath_from_date(config, date), date)
     return
 
-def timesheet_fpath_from_date(date):
-    return os.path.join(TIMESHEET_PATH, f"{date.isoformat()}.tsv")
+def timesheet_fpath_from_date(config, date):
+    fpath = os.path.join(config.timesheet_path, f"{date.isoformat()}.tsv")
+    fpath = preprocess_fpath(fpath)
+    return fpath
 
 def timesheetlist_get_categories(timesheets):
     categories = set()
@@ -253,19 +301,19 @@ def timesheetlist_get_categories(timesheets):
                 categories.add(tse.category)
     return categories
 
-def timesheet_exists_for_date(date):
-    ts_fpath = timesheet_fpath_from_date(date)
+def timesheet_exists_for_date(config, date):
+    ts_fpath = timesheet_fpath_from_date(config, date)
     return os.path.isfile(ts_fpath) and os.access(ts_fpath, os.R_OK)
 
-def timesheetlist_generate_from_date_range(date0, date1):
+def timesheetlist_generate_from_date_range(config, date0, date1):
     timesheets = list()
     daten = None
     daycount_td = date1 - date0
     for dayn in range(daycount_td.days + 1):
         daten = date0 + datetime.timedelta(days=dayn)
         log_debug(f"Parsing timesheet from {daten.isoformat()}")
-        if timesheet_exists_for_date(daten):
-            timesheets.append(timesheet_from_fpath(timesheet_fpath_from_date(daten), daten))
+        if timesheet_exists_for_date(config, daten):
+            timesheets.append(timesheet_from_fpath(timesheet_fpath_from_date(config, daten), daten))
     return timesheets
 
 def report_from_date_range(date0, date1):
@@ -515,7 +563,7 @@ if __name__ == "__main__":
             report_from_date(config, today)
             exit_code = 0
         except FileNotFoundError:
-            log_error(f"No timesheet found for today ({today.isoformat()}).")
+            log_error(f"No timesheet found for today, {today.isoformat()}.")
             log_debug(f"Searched in '{config.timesheet_path}'.")
 
     sys.exit(exit_code)
